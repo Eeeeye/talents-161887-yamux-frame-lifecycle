@@ -6,7 +6,7 @@
 -		fallthrough
 +		// LocalClose only prohibits further local writes. Handle reads normally.
 @@ -140,0 +142,3 @@
-+	if err == ErrSessionShutdown {
++	if errors.Is(err, ErrSessionShutdown) || errors.Is(err, io.ErrClosedPipe) {
 +		err = nil
 +	}
 @@ -218,0 +223,4 @@

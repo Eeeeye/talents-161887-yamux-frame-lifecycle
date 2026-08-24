@@ -1,7 +1,7 @@
 version = "1.0"
 
 [task]
-name = "a161887-yamux-frame-lifecycle"
+name = "talents/a161887-yamux-frame-lifecycle"
 authors = [{ name = "Talents Coding Author", email = "evaluation@localhost.invalid" }]
 keywords = ["go", "yamux", "multiplexing", "flow-control", "concurrency", "deadlines"]
 

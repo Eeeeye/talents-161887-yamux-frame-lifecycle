@@ -1,0 +1,64 @@
+--- a/stream.go
++++ b/stream.go
+@@ -7,0 +8 @@
++	"errors"
+@@ -111 +112 @@
+-		fallthrough
++		// LocalClose only prohibits further local writes. Handle reads normally.
+@@ -140,0 +142,3 @@
++	if err == ErrSessionShutdown {
++		err = nil
++	}
+@@ -218,0 +223,4 @@
++		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
++			// Message left in ready queue, header re-use is unsafe.
++			s.sendHdr = header(make([]byte, headerSize))
++		}
+@@ -298,0 +307,4 @@
++		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
++			// Message left in ready queue, header re-use is unsafe.
++			s.controlHdr = header(make([]byte, headerSize))
++		}
+@@ -312,0 +325,4 @@
++		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
++			// Message left in ready queue, header re-use is unsafe.
++			s.controlHdr = header(make([]byte, headerSize))
++		}
+@@ -501 +517,2 @@
+-	if _, err := io.Copy(s.recvBuf, conn); err != nil {
++	copiedLength, err := io.Copy(s.recvBuf, conn)
++	if err != nil {
+@@ -508 +525 @@
+-	s.recvWindow -= length
++	s.recvWindow -= uint32(copiedLength)
+@@ -529,0 +547 @@
++	asyncNotify(s.recvNotifyCh)
+@@ -535,0 +554 @@
++	asyncNotify(s.sendNotifyCh)
+--- a/session.go
++++ b/session.go
+@@ -412,0 +413,20 @@
++	}
++
++	bodyCopy := func() {
++		if body == nil {
++			return // A nil body is ignored.
++		}
++
++		// In the event of session shutdown or connection write timeout,
++		// we need to prevent `send` from reading the body buffer after
++		// returning from this function since the caller may re-use the
++		// underlying array.
++		ready.mu.Lock()
++		defer ready.mu.Unlock()
++
++		if ready.Body == nil {
++			return // Body was already copied in `send`.
++		}
++		newBody := make([]byte, len(body))
++		copy(newBody, body)
++		ready.Body = newBody
+@@ -418,0 +439 @@
++		bodyCopy()
+@@ -420,0 +442 @@
++		bodyCopy()

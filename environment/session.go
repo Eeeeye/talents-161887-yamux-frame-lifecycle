@@ -192,10 +192,6 @@ GET_ID:
 	s.inflight[id] = struct{}{}
 	s.streamLock.Unlock()
 
-	if s.config.StreamOpenTimeout > 0 {
-		go s.setOpenTimeout(stream)
-	}
-
 	// Send the window update to create
 	if err := stream.sendWindowUpdate(); err != nil {
 		select {
@@ -296,7 +292,6 @@ func (s *Session) Close() error {
 	for _, stream := range s.streams {
 		stream.forceClose()
 	}
-	<-s.sendDoneCh
 	return nil
 }
 
@@ -611,17 +606,11 @@ func (s *Session) handlePing(hdr header) error {
 	flags := hdr.Flags()
 	pingID := hdr.Length()
 
-	// Check if this is a query, respond back in a separate context so we
-	// don't interfere with the receiving thread blocking for the write.
+	// Check if this is a query, respond back.
 	if flags&flagSYN == flagSYN {
-		go func() {
-			hdr := header(make([]byte, headerSize))
-			hdr.encode(typePing, flagACK, 0, pingID)
-			if err := s.sendNoWait(hdr); err != nil {
-				s.logger.Printf("[WARN] yamux: failed to send ping reply: %v", err)
-			}
-		}()
-		return nil
+		hdr := header(make([]byte, headerSize))
+		hdr.encode(typePing, flagACK, 0, pingID)
+		return s.sendNoWait(hdr)
 	}
 
 	// Handle a response

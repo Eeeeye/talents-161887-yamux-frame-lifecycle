@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -174,6 +175,19 @@ func TestContractReadDeadlineReplacesBlockedWait(t *testing.T) {
 		}
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("blocked read did not observe updated deadline")
+	}
+}
+
+func TestContractTimeoutMatchesNetConnSemantics(t *testing.T) {
+	if ErrTimeout.Error() != "i/o deadline reached" {
+		t.Fatalf("timeout error message changed: %q", ErrTimeout.Error())
+	}
+	var netErr net.Error
+	if !errors.As(ErrTimeout, &netErr) || !netErr.Timeout() || !netErr.Temporary() {
+		t.Fatalf("timeout is not a temporary net.Error: %T %v", ErrTimeout, ErrTimeout)
+	}
+	if !errors.Is(ErrTimeout, os.ErrDeadlineExceeded) {
+		t.Fatalf("timeout does not wrap os.ErrDeadlineExceeded: %v", ErrTimeout)
 	}
 }
 
@@ -741,5 +755,246 @@ func TestContractPublicStreamMetadataAndAliases(t *testing.T) {
 	}
 	if err := serverStream.Close(); err != nil {
 		t.Fatalf("close server stream: %v", err)
+	}
+}
+
+type contractSilentConn struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newContractSilentConn() *contractSilentConn {
+	return &contractSilentConn{closed: make(chan struct{})}
+}
+
+func (c *contractSilentConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *contractSilentConn) Write(p []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	default:
+		return len(p), nil
+	}
+}
+
+func (c *contractSilentConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestContractOpenTimeoutClosesUnacknowledgedSession(t *testing.T) {
+	conn := newContractSilentConn()
+	cfg := contractConfig()
+	cfg.StreamOpenTimeout = 40 * time.Millisecond
+	cfg.ConnectionWriteTimeout = 200 * time.Millisecond
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create silent-peer session: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	if _, err := session.OpenStream(); err != nil {
+		t.Fatalf("queue unacknowledged stream: %v", err)
+	}
+	select {
+	case <-session.CloseChan():
+		if !session.IsClosed() {
+			t.Fatal("open timeout closed the signal channel without closing the session")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("unacknowledged stream did not close its session at StreamOpenTimeout")
+	}
+}
+
+type contractKeepaliveBlockedConn struct {
+	unblock     chan struct{}
+	unblockOnce sync.Once
+}
+
+func newContractKeepaliveBlockedConn() *contractKeepaliveBlockedConn {
+	return &contractKeepaliveBlockedConn{unblock: make(chan struct{})}
+}
+
+func (c *contractKeepaliveBlockedConn) Read([]byte) (int, error) {
+	<-c.unblock
+	return 0, io.EOF
+}
+
+func (c *contractKeepaliveBlockedConn) Write([]byte) (int, error) {
+	<-c.unblock
+	return 0, io.ErrClosedPipe
+}
+
+func (c *contractKeepaliveBlockedConn) Close() error { return nil }
+
+func (c *contractKeepaliveBlockedConn) release() {
+	c.unblockOnce.Do(func() { close(c.unblock) })
+}
+
+func TestContractCloseAfterKeepaliveFailureIsIdempotent(t *testing.T) {
+	conn := newContractKeepaliveBlockedConn()
+	cfg := contractConfig()
+	cfg.EnableKeepAlive = true
+	cfg.KeepAliveInterval = 10 * time.Millisecond
+	cfg.ConnectionWriteTimeout = 25 * time.Millisecond
+	session, err := Server(conn, cfg)
+	if err != nil {
+		t.Fatalf("create blocked keepalive session: %v", err)
+	}
+	t.Cleanup(conn.release)
+
+	select {
+	case <-session.CloseChan():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("keepalive failure did not start session shutdown")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("repeat Close after keepalive failure: %v", err)
+		}
+	case <-time.After(125 * time.Millisecond):
+		conn.release()
+		<-closed
+		t.Fatal("Close blocked after keepalive-triggered shutdown already won ownership")
+	}
+}
+
+type contractSplitCloseConn struct {
+	readClosed   chan struct{}
+	writeStarted chan struct{}
+	writeRelease chan struct{}
+
+	readOnce    sync.Once
+	startedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newContractSplitCloseConn() *contractSplitCloseConn {
+	return &contractSplitCloseConn{
+		readClosed:   make(chan struct{}),
+		writeStarted: make(chan struct{}),
+		writeRelease: make(chan struct{}),
+	}
+}
+
+func (c *contractSplitCloseConn) Read([]byte) (int, error) {
+	<-c.readClosed
+	return 0, io.EOF
+}
+
+func (c *contractSplitCloseConn) Write(p []byte) (int, error) {
+	c.startedOnce.Do(func() { close(c.writeStarted) })
+	<-c.writeRelease
+	return len(p), nil
+}
+
+func (c *contractSplitCloseConn) Close() error {
+	c.readOnce.Do(func() { close(c.readClosed) })
+	return nil
+}
+
+func (c *contractSplitCloseConn) releaseWrite() {
+	c.releaseOnce.Do(func() { close(c.writeRelease) })
+}
+
+func TestContractNormalCloseWaitsForSendQuiescence(t *testing.T) {
+	conn := newContractSplitCloseConn()
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 500 * time.Millisecond
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create split-close session: %v", err)
+	}
+	t.Cleanup(conn.releaseWrite)
+
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typePing, flagSYN, 0, 0x51554945)
+	go func() { _ = session.waitForSend(hdr, nil) }()
+	select {
+	case <-conn.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("send loop did not enter the delayed transport write")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close() }()
+	select {
+	case err := <-closed:
+		conn.releaseWrite()
+		t.Fatalf("Close returned before the send loop stopped: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	conn.releaseWrite()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close after send quiescence: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after the delayed send loop stopped")
+	}
+}
+
+func TestContractPingReplyDoesNotBlockReceiveDispatch(t *testing.T) {
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 250 * time.Millisecond
+	session := &Session{
+		config:     cfg,
+		logger:     log.New(io.Discard, "", 0),
+		pings:      make(map[uint32]chan struct{}),
+		sendCh:     make(chan *sendReady, 1),
+		shutdownCh: make(chan struct{}),
+	}
+	session.sendCh <- &sendReady{}
+
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typePing, flagSYN, 0, 0x70696e67)
+	result := make(chan error, 1)
+	go func() { result <- session.handlePing(hdr) }()
+
+	select {
+	case err := <-result:
+		close(session.shutdownCh)
+		if err != nil {
+			t.Fatalf("dispatch ping query: %v", err)
+		}
+	case <-time.After(50 * time.Millisecond):
+		close(session.shutdownCh)
+		<-result
+		t.Fatal("ping reply blocked receive dispatch behind a congested send queue")
+	}
+}
+
+func TestContractFailedPingsReleaseTracking(t *testing.T) {
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 20 * time.Millisecond
+	session := &Session{
+		config:     cfg,
+		logger:     log.New(io.Discard, "", 0),
+		pings:      make(map[uint32]chan struct{}),
+		sendCh:     make(chan *sendReady, 1),
+		shutdownCh: make(chan struct{}),
+	}
+	session.sendCh <- &sendReady{}
+
+	for i := 0; i < 4; i++ {
+		if _, err := session.Ping(); !errors.Is(err, ErrConnectionWriteTimeout) {
+			t.Fatalf("failed ping %d returned %v, want write timeout", i, err)
+		}
+		session.pingLock.Lock()
+		pending := len(session.pings)
+		session.pingLock.Unlock()
+		if pending != 0 {
+			t.Fatalf("failed ping %d retained %d pending entries", i, pending)
+		}
 	}
 }

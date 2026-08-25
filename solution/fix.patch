@@ -1,3 +1,27 @@
+--- a/const.go
++++ b/const.go
+@@ -8,0 +9 @@
++	"os"
+@@ -29,0 +31,12 @@
++// Unwrap exposes the underlying error for errors.Is and errors.As.
++func (e *NetError) Unwrap() error {
++	return e.err
++}
++
++// deadlineReached preserves the package's error text while exposing the
++// standard net.Conn deadline sentinel.
++type deadlineReached struct{}
++
++func (deadlineReached) Error() string { return "i/o deadline reached" }
++func (deadlineReached) Unwrap() error { return os.ErrDeadlineExceeded }
++
+@@ -56 +69 @@
+-		err: fmt.Errorf("i/o deadline reached"),
++		err: deadlineReached{},
+@@ -60 +73,2 @@
+-		timeout: true,
++		timeout:   true,
++		temporary: true,
 --- a/stream.go
 +++ b/stream.go
 @@ -7,0 +8 @@
@@ -37,9 +61,78 @@
 +	asyncNotify(s.sendNotifyCh)
 --- a/session.go
 +++ b/session.go
-@@ -412,0 +413,20 @@
+@@ -193,0 +194,4 @@
++
++	if s.config.StreamOpenTimeout > 0 {
++		go s.setOpenTimeout(stream)
++	}
+@@ -269 +272,0 @@
+-// Attempts to send a GoAway before closing the connection.
+@@ -270,0 +274,14 @@
++	if !s.startShutdown(ErrSessionShutdown) {
++		return nil
 +	}
 +
++	_ = s.conn.Close()
++	<-s.recvDoneCh
++	s.forceCloseStreams()
++	<-s.sendDoneCh
++	return nil
++}
++
++// startShutdown marks the session as shutting down and closes shutdownCh
++// once. The caller that wins this race completes the rest of shutdown.
++func (s *Session) startShutdown(err error) bool {
+@@ -275 +292 @@
+-		return nil
++		return false
+@@ -281 +298 @@
+-		s.shutdownErr = ErrSessionShutdown
++		s.shutdownErr = err
+@@ -286,3 +303,2 @@
+-
+-	_ = s.conn.Close()
+-	<-s.recvDoneCh
++	return true
++}
+@@ -289,0 +306,2 @@
++// forceCloseStreams closes every registered stream during session shutdown.
++func (s *Session) forceCloseStreams() {
+@@ -295 +312,0 @@
+-	return nil
+@@ -299 +316 @@
+-// session to terminate.
++// session to terminate. It must not re-enter blocking Close.
+@@ -301,3 +318,2 @@
+-	s.shutdownErrLock.Lock()
+-	if s.shutdownErr == nil {
+-		s.shutdownErr = err
++	if !s.startShutdown(err) {
++		return
+@@ -305,2 +321,2 @@
+-	s.shutdownErrLock.Unlock()
+-	_ = s.Close()
++	_ = s.conn.Close()
++	s.forceCloseStreams()
+@@ -338,0 +355 @@
++		s.retirePing(id, ch)
+@@ -347,3 +364 @@
+-		s.pingLock.Lock()
+-		delete(s.pings, id) // Ignore it if a response comes later.
+-		s.pingLock.Unlock()
++		s.retirePing(id, ch)
+@@ -351,0 +367 @@
++		s.retirePing(id, ch)
+@@ -358,0 +375,8 @@
++func (s *Session) retirePing(id uint32, ch chan struct{}) {
++	s.pingLock.Lock()
++	if s.pings[id] == ch {
++		delete(s.pings, id)
++	}
++	s.pingLock.Unlock()
++}
++
+@@ -409,0 +434,20 @@
 +	bodyCopy := func() {
 +		if body == nil {
 +			return // A nil body is ignored.
@@ -58,7 +151,25 @@
 +		newBody := make([]byte, len(body))
 +		copy(newBody, body)
 +		ready.Body = newBody
-@@ -418,0 +439 @@
++	}
++
+@@ -413,0 +458 @@
 +		bodyCopy()
-@@ -420,0 +442 @@
+@@ -415,0 +461 @@
 +		bodyCopy()
+@@ -609 +655,2 @@
+-	// Check if this is a query, respond back.
++	// Check if this is a query, respond back in a separate context so we
++	// don't interfere with the receiving thread blocking for the write.
+@@ -611,3 +658,8 @@
+-		hdr := header(make([]byte, headerSize))
+-		hdr.encode(typePing, flagACK, 0, pingID)
+-		return s.sendNoWait(hdr)
++		go func() {
++			hdr := header(make([]byte, headerSize))
++			hdr.encode(typePing, flagACK, 0, pingID)
++			if err := s.sendNoWait(hdr); err != nil {
++				s.logger.Printf("[WARN] yamux: failed to send ping reply: %v", err)
++			}
++		}()
++		return nil

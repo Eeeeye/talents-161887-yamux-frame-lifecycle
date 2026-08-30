@@ -6,7 +6,7 @@ authors = [{ name = "Talents Coding Author", email = "evaluation@localhost.inval
 keywords = ["go", "yamux", "multiplexing", "flow-control", "concurrency", "deadlines"]
 
 [metadata]
-difficulty = "hard"
+difficulty = "expert"
 category = "debugging"
 tags = ["go", "network-protocol", "state-machine", "concurrency", "systems"]
 

@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -341,6 +342,50 @@ func TestContractShortFrameChargesActualBytes(t *testing.T) {
 	}
 }
 
+func TestContractShortFrameBeyondReceiveWindowIsRejectedBeforeRead(t *testing.T) {
+	cfg := contractConfig()
+	session := &Session{config: cfg, logger: log.New(io.Discard, "", 0)}
+	stream := newStream(session, 19, streamEstablished)
+	stream.recvWindow = 31
+
+	body := bytes.NewReader(bytes.Repeat([]byte{0xa5}, 32))
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeData, 0, stream.id, 32)
+
+	err := stream.readData(hdr, 0, body)
+	if !errors.Is(err, ErrRecvWindowExceeded) {
+		t.Fatalf("over-window short frame returned %v, want %v", err, ErrRecvWindowExceeded)
+	}
+	if stream.recvWindow != 31 {
+		t.Fatalf("over-window frame changed receive window: got=%d want=31", stream.recvWindow)
+	}
+	if stream.recvBuf != nil {
+		t.Fatal("over-window frame allocated or buffered data before rejection")
+	}
+	if body.Len() != 32 {
+		t.Fatalf("over-window frame consumed %d bytes before rejection", 32-body.Len())
+	}
+}
+
+func TestContractZeroByteShortFramePreservesReceiveWindow(t *testing.T) {
+	cfg := contractConfig()
+	session := &Session{config: cfg, logger: log.New(io.Discard, "", 0)}
+	stream := newStream(session, 21, streamEstablished)
+	before := stream.recvWindow
+
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeData, 0, stream.id, 4096)
+	if err := stream.readData(hdr, 0, bytes.NewReader(nil)); err != nil {
+		t.Fatalf("read zero-byte short frame: %v", err)
+	}
+	if stream.recvWindow != before {
+		t.Fatalf("zero-byte short frame changed receive window: got=%d want=%d", stream.recvWindow, before)
+	}
+	if stream.recvBuf == nil || stream.recvBuf.Len() != 0 {
+		t.Fatalf("zero-byte short frame buffered data: %#v", stream.recvBuf)
+	}
+}
+
 type contractStagedConn struct {
 	blockAt int32
 	attempt int32
@@ -561,6 +606,194 @@ func TestContractQueuedControlHeaderIsSnapshot(t *testing.T) {
 	closeHeader := header(writes[2])
 	if len(closeHeader) != headerSize || closeHeader.MsgType() != typeWindowUpdate || closeHeader.Flags()&flagFIN == 0 || closeHeader.Length() != 0 {
 		t.Fatalf("queued close header invalid: %v", closeHeader)
+	}
+}
+
+type contractShutdownStagedConn struct {
+	blockAt int32
+	attempt int32
+
+	started    chan struct{}
+	release    chan struct{}
+	readClosed chan struct{}
+
+	startOnce   sync.Once
+	releaseOnce sync.Once
+	closeOnce   sync.Once
+
+	mu       sync.Mutex
+	captured [][]byte
+}
+
+func newContractShutdownStagedConn(blockAt int32) *contractShutdownStagedConn {
+	return &contractShutdownStagedConn{
+		blockAt:    blockAt,
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+		readClosed: make(chan struct{}),
+	}
+}
+
+func (c *contractShutdownStagedConn) Read([]byte) (int, error) {
+	<-c.readClosed
+	return 0, io.EOF
+}
+
+func (c *contractShutdownStagedConn) Write(p []byte) (int, error) {
+	if atomic.AddInt32(&c.attempt, 1) == c.blockAt {
+		c.startOnce.Do(func() { close(c.started) })
+		<-c.release
+	}
+	copyOfP := append([]byte(nil), p...)
+	c.mu.Lock()
+	c.captured = append(c.captured, copyOfP)
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+func (c *contractShutdownStagedConn) Close() error {
+	c.closeOnce.Do(func() { close(c.readClosed) })
+	return nil
+}
+
+func (c *contractShutdownStagedConn) releaseWrite() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
+func (c *contractShutdownStagedConn) snapshot() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][]byte, len(c.captured))
+	for i := range c.captured {
+		out[i] = append([]byte(nil), c.captured[i]...)
+	}
+	return out
+}
+
+func contractShutdownStagedStream(t *testing.T) (*Session, *Stream, *contractShutdownStagedConn) {
+	t.Helper()
+	conn := newContractShutdownStagedConn(2)
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 2 * time.Second
+	cfg.StreamOpenTimeout = 0
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create shutdown-staged session: %v", err)
+	}
+	stream, err := session.OpenStream()
+	if err != nil {
+		conn.releaseWrite()
+		_ = session.Close()
+		t.Fatalf("open shutdown-staged stream: %v", err)
+	}
+	contractWaitFor(t, time.Second, func() bool { return len(conn.snapshot()) == 1 }, "initial shutdown-staged SYN was not written")
+	return session, stream, conn
+}
+
+func TestContractQueuedDataBodyIsSnapshotOnSessionShutdown(t *testing.T) {
+	session, stream, conn := contractShutdownStagedStream(t)
+	defer conn.releaseWrite()
+
+	payload := make([]byte, 313)
+	_, _ = rand.New(rand.NewSource(77831)).Read(payload)
+	original := append([]byte(nil), payload...)
+	writeResult := make(chan contractWriteResult, 1)
+	go func() {
+		n, err := stream.Write(payload)
+		writeResult <- contractWriteResult{n: n, err: err}
+	}()
+
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown-staged data header never reached transport")
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- session.Close() }()
+	select {
+	case got := <-writeResult:
+		if got.n != 0 || !errors.Is(got.err, ErrSessionShutdown) {
+			t.Fatalf("write interrupted by shutdown: n=%d err=%v", got.n, got.err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("queued data writer did not observe session shutdown")
+	}
+
+	for i := range payload {
+		payload[i] ^= 0xff
+	}
+	conn.releaseWrite()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("close shutdown-staged session: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session close did not finish after releasing queued data")
+	}
+
+	writes := conn.snapshot()
+	if len(writes) < 3 {
+		t.Fatalf("captured %d writes, want SYN plus DATA header/body", len(writes))
+	}
+	dataHeader := header(writes[1])
+	if dataHeader.MsgType() != typeData || dataHeader.Length() != uint32(len(original)) {
+		t.Fatalf("queued shutdown data header changed: %v", dataHeader)
+	}
+	if !bytes.Equal(writes[2], original) {
+		t.Fatal("queued shutdown data body aliased caller buffer")
+	}
+}
+
+func TestContractQueuedControlHeaderIsSnapshotOnSessionShutdown(t *testing.T) {
+	session, stream, conn := contractShutdownStagedStream(t)
+	defer conn.releaseWrite()
+
+	stream.recvLock.Lock()
+	stream.recvWindow = 0
+	stream.recvBuf = nil
+	stream.recvLock.Unlock()
+
+	windowResult := make(chan error, 1)
+	go func() { windowResult <- stream.sendWindowUpdate() }()
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown-staged window header never reached transport")
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- session.Close() }()
+	select {
+	case err := <-windowResult:
+		if !errors.Is(err, ErrSessionShutdown) {
+			t.Fatalf("window update interrupted by shutdown returned %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("queued window update did not observe session shutdown")
+	}
+
+	if err := stream.sendClose(); !errors.Is(err, ErrSessionShutdown) {
+		t.Fatalf("post-shutdown FIN returned %v", err)
+	}
+	conn.releaseWrite()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("close shutdown-staged control session: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session close did not finish after releasing queued control header")
+	}
+
+	writes := conn.snapshot()
+	if len(writes) < 2 {
+		t.Fatalf("captured %d writes, want SYN plus window update", len(writes))
+	}
+	windowHeader := header(writes[1])
+	if windowHeader.MsgType() != typeWindowUpdate || windowHeader.Flags() != 0 || windowHeader.Length() != stream.session.config.MaxStreamWindowSize {
+		t.Fatalf("queued shutdown control header changed: %v", windowHeader)
 	}
 }
 
@@ -808,15 +1041,46 @@ func TestContractOpenTimeoutClosesUnacknowledgedSession(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("unacknowledged stream did not close its session at StreamOpenTimeout")
 	}
+	contractWaitFor(t, 300*time.Millisecond, func() bool {
+		session.streamLock.Lock()
+		defer session.streamLock.Unlock()
+		return len(session.streams) == 0 && len(session.inflight) == 0 && len(session.synCh) == 0
+	}, "open-timeout shutdown leaked stream, inflight, or semaphore state")
+}
+
+func TestContractZeroOpenTimeoutLeavesUnacknowledgedSessionOpen(t *testing.T) {
+	conn := newContractSilentConn()
+	cfg := contractConfig()
+	cfg.StreamOpenTimeout = 0
+	cfg.ConnectionWriteTimeout = 200 * time.Millisecond
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create zero-timeout silent-peer session: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	if _, err := session.OpenStream(); err != nil {
+		t.Fatalf("queue zero-timeout unacknowledged stream: %v", err)
+	}
+	select {
+	case <-session.CloseChan():
+		t.Fatal("zero StreamOpenTimeout unexpectedly closed the session")
+	case <-time.After(120 * time.Millisecond):
+	}
+	if session.IsClosed() {
+		t.Fatal("zero StreamOpenTimeout reported a closed session")
+	}
 }
 
 type contractKeepaliveBlockedConn struct {
-	unblock     chan struct{}
-	unblockOnce sync.Once
+	unblock      chan struct{}
+	writeStarted chan struct{}
+	unblockOnce  sync.Once
+	startedOnce  sync.Once
 }
 
 func newContractKeepaliveBlockedConn() *contractKeepaliveBlockedConn {
-	return &contractKeepaliveBlockedConn{unblock: make(chan struct{})}
+	return &contractKeepaliveBlockedConn{unblock: make(chan struct{}), writeStarted: make(chan struct{})}
 }
 
 func (c *contractKeepaliveBlockedConn) Read([]byte) (int, error) {
@@ -825,6 +1089,7 @@ func (c *contractKeepaliveBlockedConn) Read([]byte) (int, error) {
 }
 
 func (c *contractKeepaliveBlockedConn) Write([]byte) (int, error) {
+	c.startedOnce.Do(func() { close(c.writeStarted) })
 	<-c.unblock
 	return 0, io.ErrClosedPipe
 }
@@ -974,6 +1239,57 @@ func TestContractPingReplyDoesNotBlockReceiveDispatch(t *testing.T) {
 	}
 }
 
+func TestContractPingReplyBurstUsesBoundedConcurrency(t *testing.T) {
+	conn := newContractKeepaliveBlockedConn()
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 500 * time.Millisecond
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create burst-ping session: %v", err)
+	}
+	finish := func() {
+		conn.release()
+		_ = session.Close()
+	}
+	defer finish()
+
+	blockingHeader := header(make([]byte, headerSize))
+	blockingHeader.encode(typeGoAway, 0, 0, goAwayNormal)
+	go func() { _ = session.waitForSend(blockingHeader, nil) }()
+	select {
+	case <-conn.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("send loop did not enter blocked transport for ping burst")
+	}
+	for len(session.sendCh) < cap(session.sendCh) {
+		session.sendCh <- &sendReady{}
+	}
+
+	baseline := runtime.NumGoroutine()
+	burstDone := make(chan struct{})
+	go func() {
+		for i := 0; i < 192; i++ {
+			hdr := header(make([]byte, headerSize))
+			hdr.encode(typePing, flagSYN, 0, uint32(i+1))
+			_ = session.handlePing(hdr)
+		}
+		close(burstDone)
+	}()
+
+	select {
+	case <-burstDone:
+	case <-time.After(100 * time.Millisecond):
+		finish()
+		<-burstDone
+		t.Fatal("ping query burst blocked receive-style dispatch behind the send queue")
+	}
+	time.Sleep(15 * time.Millisecond)
+	if extra := runtime.NumGoroutine() - baseline; extra > 32 {
+		finish()
+		t.Fatalf("ping query burst created %d extra goroutines; reply concurrency is unbounded", extra)
+	}
+}
+
 func TestContractFailedPingsReleaseTracking(t *testing.T) {
 	cfg := contractConfig()
 	cfg.ConnectionWriteTimeout = 20 * time.Millisecond
@@ -996,5 +1312,129 @@ func TestContractFailedPingsReleaseTracking(t *testing.T) {
 		if pending != 0 {
 			t.Fatalf("failed ping %d retained %d pending entries", i, pending)
 		}
+	}
+}
+
+func TestContractConcurrentFailedPingsReleaseAllTracking(t *testing.T) {
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 25 * time.Millisecond
+	session := &Session{
+		config:     cfg,
+		logger:     log.New(io.Discard, "", 0),
+		pings:      make(map[uint32]chan struct{}),
+		sendCh:     make(chan *sendReady, 1),
+		shutdownCh: make(chan struct{}),
+	}
+	session.sendCh <- &sendReady{}
+	defer close(session.shutdownCh)
+
+	const attempts = 48
+	results := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			_, err := session.Ping()
+			results <- err
+		}()
+	}
+	for i := 0; i < attempts; i++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrConnectionWriteTimeout) {
+				t.Fatalf("concurrent failed ping returned %v, want write timeout", err)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("concurrent failed ping did not terminate")
+		}
+	}
+	session.pingLock.Lock()
+	pending := len(session.pings)
+	session.pingLock.Unlock()
+	if pending != 0 {
+		t.Fatalf("concurrent failed pings retained %d pending entries", pending)
+	}
+}
+
+func TestContractPingResponseTimeoutReleasesTracking(t *testing.T) {
+	conn := newContractSilentConn()
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 30 * time.Millisecond
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create response-timeout session: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	if _, err := session.Ping(); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("unanswered ping returned %v, want response timeout", err)
+	}
+	session.pingLock.Lock()
+	pending := len(session.pings)
+	session.pingLock.Unlock()
+	if pending != 0 {
+		t.Fatalf("response-timeout ping retained %d pending entries", pending)
+	}
+}
+
+func TestContractSessionShutdownReleasesPingTracking(t *testing.T) {
+	conn := newContractSilentConn()
+	cfg := contractConfig()
+	cfg.ConnectionWriteTimeout = 2 * time.Second
+	session, err := Client(conn, cfg)
+	if err != nil {
+		t.Fatalf("create shutdown-ping session: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := session.Ping()
+		result <- err
+	}()
+	contractWaitFor(t, time.Second, func() bool {
+		session.pingLock.Lock()
+		defer session.pingLock.Unlock()
+		return len(session.pings) == 1
+	}, "ping was not registered before shutdown")
+	if err := session.Close(); err != nil {
+		t.Fatalf("close shutdown-ping session: %v", err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrSessionShutdown) {
+			t.Fatalf("shutdown ping returned %v, want session shutdown", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("shutdown did not release pending ping")
+	}
+	session.pingLock.Lock()
+	pending := len(session.pings)
+	session.pingLock.Unlock()
+	if pending != 0 {
+		t.Fatalf("session shutdown retained %d pending ping entries", pending)
+	}
+}
+
+func TestContractLatePingAckIsIgnoredWithoutTouchingLivePing(t *testing.T) {
+	live := make(chan struct{})
+	session := &Session{
+		config: contractConfig(),
+		logger: log.New(io.Discard, "", 0),
+		pings:  map[uint32]chan struct{}{44: live},
+	}
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typePing, flagACK, 0, 43)
+	if err := session.handlePing(hdr); err != nil {
+		t.Fatalf("handle late ping ACK: %v", err)
+	}
+	session.pingLock.Lock()
+	got := session.pings[44]
+	count := len(session.pings)
+	session.pingLock.Unlock()
+	if count != 1 || got != live {
+		t.Fatalf("late ACK changed unrelated pending ping: count=%d got=%p want=%p", count, got, live)
+	}
+	select {
+	case <-live:
+		t.Fatal("late ACK closed an unrelated pending ping")
+	default:
 	}
 }

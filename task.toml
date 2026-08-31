@@ -14,7 +14,7 @@ tags = ["go", "network-protocol", "state-machine", "concurrency", "systems"]
 timeout_sec = 180.0
 
 [agent]
-timeout_sec = 7200.0
+timeout_sec = 1800.0
 
 [environment]
 build_timeout_sec = 900.0
